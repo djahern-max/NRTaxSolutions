@@ -35,7 +35,7 @@ cd frontend || handle_error "Failed to change to frontend directory"
 
 # Set up React with Tailwind CSS
 echo -e "\n${YELLOW}Setting up React with Tailwind CSS...${NC}"
-npx create-react-app . --use-npm || handle_error "Failed to create React app"
+npx create-react-app . --use-npm --no-git || handle_error "Failed to create React app"
 
 # Install dependencies - Note: Using older versions of Tailwind that are known to work well
 echo -e "\n${YELLOW}Installing necessary dependencies...${NC}"
