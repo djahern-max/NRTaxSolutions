@@ -1,0 +1,2997 @@
+First, let's create the project structure and set up the backend:
+
+# Create project directory structure
+mkdir -p ryze-nrtax/{backend,frontend}
+cd ryze-nrtax
+
+# Set up Python virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows use: venv\Scripts\activate
+
+# Set up backend
+cd backend
+pip install fastapi uvicorn sqlalchemy psycopg2-binary pydantic python-jose[cryptography] passlib[bcrypt] python-multipart
+pip freeze > requirements.txt
+
+# Create backend directory structure
+mkdir -p app/{routers,models,schemas,crud,core,db}
+touch app/__init__.py app/main.py
+touch app/routers/__init__.py app/models/__init__.py app/schemas/__init__.py
+touch app/crud/__init__.py app/core/__init__.py app/db/__init__.py
+
+Now, let's set up the PostgreSQL database:
+
+# Create database (assumes PostgreSQL is installed)
+createdb ryze_nrtax_db
+
+# Create database migration script
+cat > app/db/init_db.py << 'EOF'
+from sqlalchemy import create_engine, MetaData, Table, Column, Integer, String, Text, Boolean, DateTime, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.sql import func
+
+DATABASE_URL = "postgresql://localhost/ryze_nrtax_db"
+engine = create_engine(DATABASE_URL)
+metadata = MetaData()
+Base = declarative_base()
+
+def init_db():
+    Base.metadata.create_all(bind=engine)
+
+if __name__ == "__main__":
+    init_db()
+    print("Database tables created.")
+EOF
+
+# Run the database initialization script
+python app/db/init_db.py
+
+Let's create our database models:
+
+# Create models for our application
+cat > app/models/models.py << 'EOF'
+from sqlalchemy import Boolean, Column, ForeignKey, Integer, String, Text, DateTime
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+
+from app.db.init_db import Base
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True)
+    hashed_password = Column(String)
+    is_active = Column(Boolean, default=True)
+    is_premium = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    consultations = relationship("Consultation", back_populates="user")
+
+class TaxGuide(Base):
+    __tablename__ = "tax_guides"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, index=True)
+    content = Column(Text)
+    is_premium = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+class Consultation(Base):
+    __tablename__ = "consultations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    subject = Column(String)
+    message = Column(Text)
+    status = Column(String, default="pending")  # pending, scheduled, completed
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    user = relationship("User", back_populates="consultations")
+
+class FAQ(Base):
+    __tablename__ = "faqs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    question = Column(String)
+    answer = Column(Text)
+    category = Column(String)
+    is_premium = Column(Boolean, default=False)
+EOF
+
+# Update __init__.py to import models
+echo "from app.models.models import User, TaxGuide, Consultation, FAQ" > app/models/__init__.py
+
+Now, let's create our database schemas:
+
+# Create Pydantic schemas
+cat > app/schemas/schemas.py << 'EOF'
+from typing import List, Optional
+from datetime import datetime
+from pydantic import BaseModel, EmailStr
+
+# User schemas
+class UserBase(BaseModel):
+    email: EmailStr
+
+class UserCreate(UserBase):
+    password: str
+
+class User(UserBase):
+    id: int
+    is_active: bool
+    is_premium: bool
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
+
+# TaxGuide schemas
+class TaxGuideBase(BaseModel):
+    title: str
+    content: str
+    is_premium: bool
+
+class TaxGuideCreate(TaxGuideBase):
+    pass
+
+class TaxGuide(TaxGuideBase):
+    id: int
+    created_at: datetime
+    updated_at: Optional[datetime]
+
+    class Config:
+        orm_mode = True
+
+# Consultation schemas
+class ConsultationBase(BaseModel):
+    subject: str
+    message: str
+
+class ConsultationCreate(ConsultationBase):
+    pass
+
+class Consultation(ConsultationBase):
+    id: int
+    user_id: int
+    status: str
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
+
+# FAQ schemas
+class FAQBase(BaseModel):
+    question: str
+    answer: str
+    category: str
+    is_premium: bool
+
+class FAQCreate(FAQBase):
+    pass
+
+class FAQ(FAQBase):
+    id: int
+
+    class Config:
+        orm_mode = True
+
+# Token schemas
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    email: Optional[str] = None
+EOF
+
+# Update __init__.py to import schemas
+echo "from app.schemas.schemas import User, UserCreate, UserBase, TaxGuide, TaxGuideCreate, TaxGuideBase, Consultation, ConsultationCreate, ConsultationBase, FAQ, FAQCreate, FAQBase, Token, TokenData" > app/schemas/__init__.py
+
+Let's set up the authentication system:
+
+# Create authentication utilities
+cat > app/core/auth.py << 'EOF'
+from datetime import datetime, timedelta
+from typing import Optional
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
+from app.models.models import User
+from app.schemas.schemas import TokenData
+
+# to get a string like this run:
+# openssl rand -hex 32
+SECRET_KEY = "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def authenticate_user(db: Session, email: str, password: str):
+    user = db.query(User).filter(User.email == email).first()
+    if not user or not verify_password(password, user.hashed_password):
+        return False
+    return user
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+        token_data = TokenData(email=email)
+    except JWTError:
+        raise credentials_exception
+    user = db.query(User).filter(User.email == token_data.email).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+async def get_current_active_user(current_user: User = Depends(get_current_user)):
+    if not current_user.is_active:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    return current_user
+
+async def get_premium_user(current_user: User = Depends(get_current_active_user)):
+    if not current_user.is_premium:
+        raise HTTPException(status_code=403, detail="Premium feature requires subscription")
+    return current_user
+EOF
+
+# Create database session utility
+cat > app/db/session.py << 'EOF'
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+
+DATABASE_URL = "postgresql://localhost/ryze_nrtax_db"
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+EOF
+
+Now, let's create CRUD operations:
+
+# Create CRUD operations for our models
+cat > app/crud/crud.py << 'EOF'
+from sqlalchemy.orm import Session
+from app.models.models import User, TaxGuide, Consultation, FAQ
+from app.schemas import schemas
+from app.core.auth import get_password_hash
+
+# User CRUD operations
+def get_user(db: Session, user_id: int):
+    return db.query(User).filter(User.id == user_id).first()
+
+def get_user_by_email(db: Session, email: str):
+    return db.query(User).filter(User.email == email).first()
+
+def get_users(db: Session, skip: int = 0, limit: int = 100):
+    return db.query(User).offset(skip).limit(limit).all()
+
+def create_user(db: Session, user: schemas.UserCreate):
+    hashed_password = get_password_hash(user.password)
+    db_user = User(email=user.email, hashed_password=hashed_password)
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+def update_user_premium(db: Session, email: str, is_premium: bool):
+    db_user = get_user_by_email(db, email)
+    db_user.is_premium = is_premium
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+# TaxGuide CRUD operations
+def get_tax_guides(db: Session, skip: int = 0, limit: int = 100, premium_only: bool = False):
+    query = db.query(TaxGuide)
+    if premium_only:
+        query = query.filter(TaxGuide.is_premium == True)
+    return query.offset(skip).limit(limit).all()
+
+def get_tax_guide(db: Session, guide_id: int):
+    return db.query(TaxGuide).filter(TaxGuide.id == guide_id).first()
+
+def create_tax_guide(db: Session, guide: schemas.TaxGuideCreate):
+    db_guide = TaxGuide(**guide.dict())
+    db.add(db_guide)
+    db.commit()
+    db.refresh(db_guide)
+    return db_guide
+
+# Consultation CRUD operations
+def create_consultation(db: Session, consultation: schemas.ConsultationCreate, user_id: int):
+    db_consultation = Consultation(**consultation.dict(), user_id=user_id)
+    db.add(db_consultation)
+    db.commit()
+    db.refresh(db_consultation)
+    return db_consultation
+
+def get_user_consultations(db: Session, user_id: int):
+    return db.query(Consultation).filter(Consultation.user_id == user_id).all()
+
+# FAQ CRUD operations
+def get_faqs(db: Session, skip: int = 0, limit: int = 100, premium_only: bool = False):
+    query = db.query(FAQ)
+    if premium_only:
+        query = query.filter(FAQ.is_premium == True)
+    return query.offset(skip).limit(limit).all()
+
+def get_faq_by_category(db: Session, category: str):
+    return db.query(FAQ).filter(FAQ.category == category).all()
+
+def create_faq(db: Session, faq: schemas.FAQCreate):
+    db_faq = FAQ(**faq.dict())
+    db.add(db_faq)
+    db.commit()
+    db.refresh(db_faq)
+    return db_faq
+EOF
+
+Now, let's create our API routers:
+
+# Create router for authentication
+cat > app/routers/auth.py << 'EOF'
+from datetime import timedelta
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
+from app.core.auth import authenticate_user, create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
+from app.schemas.schemas import Token
+
+router = APIRouter()
+
+@router.post("/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = authenticate_user(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.email}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+EOF
+
+# Create router for users
+cat > app/routers/users.py << 'EOF'
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from typing import List
+
+from app.db.session import get_db
+from app.core.auth import get_current_active_user, get_premium_user
+from app.crud import crud
+from app.schemas import schemas
+
+router = APIRouter()
+
+@router.post("/users/", response_model=schemas.User)
+def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
+    db_user = crud.get_user_by_email(db, email=user.email)
+    if db_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    return crud.create_user(db=db, user=user)
+
+@router.get("/users/me/", response_model=schemas.User)
+async def read_users_me(current_user: schemas.User = Depends(get_current_active_user)):
+    return current_user
+
+@router.post("/users/me/premium/", response_model=schemas.User)
+async def upgrade_to_premium(current_user: schemas.User = Depends(get_current_active_user), db: Session = Depends(get_db)):
+    # In a real app, you would process payment here
+    return crud.update_user_premium(db, email=current_user.email, is_premium=True)
+EOF
+
+# Create router for tax guides
+cat > app/routers/tax_guides.py << 'EOF'
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from typing import List
+
+from app.db.session import get_db
+from app.core.auth import get_current_active_user, get_premium_user
+from app.crud import crud
+from app.schemas import schemas
+from app.models.models import User
+
+router = APIRouter()
+
+@router.get("/tax-guides/", response_model=List[schemas.TaxGuide])
+def read_tax_guides(skip: int = 0, limit: int = 100, db: Session = Depends(get_db), current_user: User = None):
+    premium_only = False
+    if current_user and current_user.is_premium:
+        premium_only = True
+    return crud.get_tax_guides(db, skip=skip, limit=limit, premium_only=premium_only)
+
+@router.get("/tax-guides/{guide_id}", response_model=schemas.TaxGuide)
+def read_tax_guide(guide_id: int, db: Session = Depends(get_db), current_user: User = None):
+    db_guide = crud.get_tax_guide(db, guide_id=guide_id)
+    if db_guide is None:
+        raise HTTPException(status_code=404, detail="Tax guide not found")
+    if db_guide.is_premium and (not current_user or not current_user.is_premium):
+        raise HTTPException(status_code=403, detail="Premium content requires subscription")
+    return db_guide
+
+@router.post("/tax-guides/", response_model=schemas.TaxGuide)
+def create_tax_guide(guide: schemas.TaxGuideCreate, db: Session = Depends(get_db)):
+    # In a real app, this would be admin-only
+    return crud.create_tax_guide(db=db, guide=guide)
+EOF
+
+# Create router for consultations
+cat > app/routers/consultations.py << 'EOF'
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from typing import List
+
+from app.db.session import get_db
+from app.core.auth import get_current_active_user
+from app.crud import crud
+from app.schemas import schemas
+from app.models.models import User
+
+router = APIRouter()
+
+@router.post("/consultations/", response_model=schemas.Consultation)
+def create_consultation(
+    consultation: schemas.ConsultationCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    return crud.create_consultation(db=db, consultation=consultation, user_id=current_user.id)
+
+@router.get("/consultations/", response_model=List[schemas.Consultation])
+def read_user_consultations(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    return crud.get_user_consultations(db, user_id=current_user.id)
+EOF
+
+# Create router for FAQs
+cat > app/routers/faqs.py << 'EOF'
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from typing import List
+
+from app.db.session import get_db
+from app.core.auth import get_current_active_user, get_premium_user
+from app.crud import crud
+from app.schemas import schemas
+from app.models.models import User
+
+router = APIRouter()
+
+@router.get("/faqs/", response_model=List[schemas.FAQ])
+def read_faqs(skip: int = 0, limit: int = 100, db: Session = Depends(get_db), current_user: User = None):
+    premium_only = False
+    if current_user and current_user.is_premium:
+        premium_only = True
+    return crud.get_faqs(db, skip=skip, limit=limit, premium_only=premium_only)
+
+@router.get("/faqs/category/{category}", response_model=List[schemas.FAQ])
+def read_faq_by_category(category: str, db: Session = Depends(get_db)):
+    return crud.get_faq_by_category(db, category=category)
+
+@router.post("/faqs/", response_model=schemas.FAQ)
+def create_faq(faq: schemas.FAQCreate, db: Session = Depends(get_db)):
+    # In a real app, this would be admin-only
+    return crud.create_faq(db=db, faq=faq)
+EOF
+
+# Update __init__.py to import routers
+echo "from app.routers import auth, users, tax_guides, consultations, faqs" > app/routers/__init__.py
+
+# Create main FastAPI application
+cat > app/main.py << 'EOF'
+from fastapi import FastAPI, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
+from app.routers import auth, users, tax_guides, consultations, faqs
+from app.models import models
+from app.db.init_db import engine
+
+# Create database tables
+models.Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Ryze NRTax API", description="API for Non-Resident Tax Information and Services")
+
+# Configure CORS
+origins = [
+    "http://localhost",
+    "http://localhost:3000",
+    "http://localhost:8000",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include routers
+app.include_router(auth.router, tags=["authentication"])
+app.include_router(users.router, prefix="/api", tags=["users"])
+app.include_router(tax_guides.router, prefix="/api", tags=["tax_guides"])
+app.include_router(consultations.router, prefix="/api", tags=["consultations"])
+app.include_router(faqs.router, prefix="/api", tags=["faqs"])
+
+@app.get("/", tags=["root"])
+async def root():
+    return {"message": "Welcome to Ryze NRTax API for Non-Resident Tax Information and Services"}
+
+# Add sample data if needed for development
+@app.on_event("startup")
+async def startup_event():
+    db = next(get_db())
+    # Check if data already exists
+    tax_guides = db.query(models.TaxGuide).all()
+    if not tax_guides:
+        # Create sample tax guides
+        db.add(models.TaxGuide(
+            title="US-China Tax Treaty Overview",
+            content="The United States and China have established a tax treaty to avoid double taxation...",
+            is_premium=False
+        ))
+        db.add(models.TaxGuide(
+            title="Form 1040-NR Guide for International Students",
+            content="As an international student, you'll likely need to file Form 1040-NR...",
+            is_premium=False
+        ))
+        db.add(models.TaxGuide(
+            title="Scholarship Taxation for Non-Residents",
+            content="Scholarships and fellowships granted to non-residents may be subject to different tax rules...",
+            is_premium=False
+        ))
+        db.add(models.TaxGuide(
+            title="Advanced Tax Planning for Non-Residents",
+            content="This premium guide covers advanced tax planning strategies...",
+            is_premium=True
+        ))
+        
+        # Create sample FAQs
+        db.add(models.FAQ(
+            question="Do I need to file a US tax return as an international student?",
+            answer="Yes, most international students will need to file at least one tax form, even if they didn't earn income...",
+            category="Filing Requirements",
+            is_premium=False
+        ))
+        db.add(models.FAQ(
+            question="What is Form 8843?",
+            answer="Form 8843 is a statement for exempt individuals with a medical condition or students...",
+            category="Forms",
+            is_premium=False
+        ))
+        db.add(models.FAQ(
+            question="How does the US-China tax treaty affect my taxes?",
+            answer="The US-China tax treaty may provide exemptions or reduced rates for certain types of income...",
+            category="Tax Treaties",
+            is_premium=False
+        ))
+        db.add(models.FAQ(
+            question="What tax deductions can international students claim?",
+            answer="As a non-resident, you may be eligible for certain deductions...",
+            category="Deductions",
+            is_premium=True
+        ))
+        
+        db.commit()
+EOF
+
+# Create main FastAPI application
+cat > app/main.py << 'EOF'
+from fastapi import FastAPI, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
+from app.routers import auth, users, tax_guides, consultations, faqs
+from app.models import models
+from app.db.init_db import engine
+
+# Create database tables
+models.Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Ryze NRTax API", description="API for Non-Resident Tax Information and Services")
+
+# Configure CORS
+origins = [
+    "http://localhost",
+    "http://localhost:3000",
+    "http://localhost:8000",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include routers
+app.include_router(auth.router, tags=["authentication"])
+app.include_router(users.router, prefix="/api", tags=["users"])
+app.include_router(tax_guides.router, prefix="/api", tags=["tax_guides"])
+app.include_router(consultations.router, prefix="/api", tags=["consultations"])
+app.include_router(faqs.router, prefix="/api", tags=["faqs"])
+
+@app.get("/", tags=["root"])
+async def root():
+    return {"message": "Welcome to Ryze NRTax API for Non-Resident Tax Information and Services"}
+
+# Add sample data if needed for development
+@app.on_event("startup")
+async def startup_event():
+    db = next(get_db())
+    # Check if data already exists
+    tax_guides = db.query(models.TaxGuide).all()
+    if not tax_guides:
+        # Create sample tax guides
+        db.add(models.TaxGuide(
+            title="US-China Tax Treaty Overview",
+            content="The United States and China have established a tax treaty to avoid double taxation...",
+            is_premium=False
+        ))
+        db.add(models.TaxGuide(
+            title="Form 1040-NR Guide for International Students",
+            content="As an international student, you'll likely need to file Form 1040-NR...",
+            is_premium=False
+        ))
+        db.add(models.TaxGuide(
+            title="Scholarship Taxation for Non-Residents",
+            content="Scholarships and fellowships granted to non-residents may be subject to different tax rules...",
+            is_premium=False
+        ))
+        db.add(models.TaxGuide(
+            title="Advanced Tax Planning for Non-Residents",
+            content="This premium guide covers advanced tax planning strategies...",
+            is_premium=True
+        ))
+        
+        # Create sample FAQs
+        db.add(models.FAQ(
+            question="Do I need to file a US tax return as an international student?",
+            answer="Yes, most international students will need to file at least one tax form, even if they didn't earn income...",
+            category="Filing Requirements",
+            is_premium=False
+        ))
+        db.add(models.FAQ(
+            question="What is Form 8843?",
+            answer="Form 8843 is a statement for exempt individuals with a medical condition or students...",
+            category="Forms",
+            is_premium=False
+        ))
+        db.add(models.FAQ(
+            question="How does the US-China tax treaty affect my taxes?",
+            answer="The US-China tax treaty may provide exemptions or reduced rates for certain types of income...",
+            category="Tax Treaties",
+            is_premium=False
+        ))
+        db.add(models.FAQ(
+            question="What tax deductions can international students claim?",
+            answer="As a non-resident, you may be eligible for certain deductions...",
+            category="Deductions",
+            is_premium=True
+        ))
+        
+        db.commit()
+EOF
+
+Now, let's set up the frontend:
+
+# Set up React with Tailwind CSS
+cd ../frontend
+npx create-react-app .
+npm install axios react-router-dom @headlessui/react @heroicons/react @tailwindcss/forms tailwindcss postcss autoprefixer
+
+# Set up Tailwind CSS
+npx tailwindcss init -p
+
+# Configure Tailwind CSS
+cat > tailwind.config.js << 'EOF'
+/** @type {import('tailwindcss').Config} */
+module.exports = {
+  content: [
+    "./src/**/*.{js,jsx,ts,tsx}",
+  ],
+  theme: {
+    extend: {
+      colors: {
+        primary: {
+          50: '#f0f9ff',
+          100: '#e0f2fe',
+          200: '#bae6fd',
+          300: '#7dd3fc',
+          400: '#38bdf8',
+          500: '#0ea5e9',
+          600: '#0284c7',
+          700: '#0369a1',
+          800: '#075985',
+          900: '#0c4a6e',
+        },
+      },
+    },
+  },
+  plugins: [
+    require('@tailwindcss/forms'),
+  ],
+}
+EOF
+
+# Add Tailwind directives to CSS
+cat > src/index.css << 'EOF'
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer components {
+  .btn-primary {
+    @apply px-4 py-2 bg-primary-600 text-white rounded-md hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500;
+  }
+  
+  .btn-secondary {
+    @apply px-4 py-2 bg-white text-gray-700 border border-gray-300 rounded-md hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500;
+  }
+  
+  .input-field {
+    @apply mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500;
+  }
+  
+  .card {
+    @apply bg-white overflow-hidden shadow-md rounded-lg p-6;
+  }
+}
+EOF
+
+Let's create the React components:
+
+# Create component directories
+mkdir -p src/{components,pages,context,services}
+
+# Create API service
+cat > src/services/api.js << 'EOF'
+import axios from 'axios';
+
+const API_URL = 'http://localhost:8000/api';
+
+const apiClient = axios.create({
+  baseURL: API_URL,
+  headers: {
+    'Content-Type': 'application/json',
+  },
+});
+
+// Add token to requests if available
+apiClient.interceptors.request.use(
+  (config) => {
+    const token = localStorage.getItem('token');
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  },
+  (error) => Promise.reject(error)
+);
+
+export const login = async (email, password) => {
+  const response = await axios.post(`http://localhost:8000/token`, 
+    new URLSearchParams({
+      'username': email,
+      'password': password,
+    }),
+    {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+    }
+  );
+  return response.data;
+};
+
+export const register = async (userData) => {
+  return apiClient.post('/users/', userData);
+};
+
+export const getCurrentUser = async () => {
+  return apiClient.get('/users/me/');
+};
+
+export const upgradeToPremium = async () => {
+  return apiClient.post('/users/me/premium/');
+};
+
+export const getTaxGuides = async () => {
+  return apiClient.get('/tax-guides/');
+};
+
+export const getTaxGuide = async (id) => {
+  return apiClient.get(`/tax-guides/${id}`);
+};
+
+export const getFaqs = async () => {
+  return apiClient.get('/faqs/');
+};
+
+export const getFaqsByCategory = async (category) => {
+  return apiClient.get(`/faqs/category/${category}`);
+};
+
+export const createConsultation = async (consultationData) => {
+  return apiClient.post('/consultations/', consultationData);
+};
+
+export const getUserConsultations = async () => {
+  return apiClient.get('/consultations/');
+};
+
+export default apiClient;
+EOF
+
+# Create auth context
+cat > src/context/AuthContext.js << 'EOF'
+import React, { createContext, useState, useEffect, useContext } from 'react';
+import { login as apiLogin, getCurrentUser } from '../services/api';
+
+const AuthContext = createContext();
+
+export const AuthProvider = ({ children }) => {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    const loadUser = async () => {
+      const token = localStorage.getItem('token');
+      if (token) {
+        try {
+          const response = await getCurrentUser();
+          setUser(response.data);
+        } catch (err) {
+          console.error('Failed to load user:', err);
+          localStorage.removeItem('token');
+        }
+      }
+      setLoading(false);
+    };
+
+    loadUser();
+  }, []);
+
+  const login = async (email, password) => {
+    try {
+      setError(null);
+      const data = await apiLogin(email, password);
+      localStorage.setItem('token', data.access_token);
+      const userResponse = await getCurrentUser();
+      setUser(userResponse.data);
+      return userResponse.data;
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Login failed');
+      throw err;
+    }
+  };
+
+  const logout = () => {
+    localStorage.removeItem('token');
+    setUser(null);
+  };
+
+  const value = {
+    user,
+    loading,
+    error,
+    login,
+    logout,
+  };
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+};
+
+export const useAuth = () => {
+  const context = useContext(AuthContext);
+  if (context === undefined) {
+    throw new Error('useAuth must be used within an AuthProvider');
+  }
+  return context;
+};
+EOF
+
+# Create a basic component for the Header
+# Continue creating the Header component
+cat > src/components/Header.js << 'EOF'
+import React from 'react';
+import { Link } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+import { Disclosure, Menu, Transition } from '@headlessui/react';
+import { MenuIcon, XIcon, UserCircleIcon } from '@heroicons/react/outline';
+
+const navigation = [
+  { name: 'Home', to: '/', current: true },
+  { name: 'Tax Guides', to: '/tax-guides', current: false },
+  { name: 'FAQs', to: '/faqs', current: false },
+  { name: 'About', to: '/about', current: false },
+];
+
+function classNames(...classes) {
+  return classes.filter(Boolean).join(' ');
+}
+
+const Header = () => {
+  const { user, logout } = useAuth();
+
+  return (
+    <Disclosure as="nav" className="bg-primary-800">
+      {({ open }) => (
+        <>
+          <div className="max-w-7xl mx-auto px-2 sm:px-6 lg:px-8">
+            <div className="relative flex items-center justify-between h-16">
+              <div className="absolute inset-y-0 left-0 flex items-center sm:hidden">
+                {/* Mobile menu button*/}
+                <Disclosure.Button className="inline-flex items-center justify-center p-2 rounded-md text-gray-200 hover:text-white hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-inset focus:ring-white">
+                  <span className="sr-only">Open main menu</span>
+                  {open ? (
+                    <XIcon className="block h-6 w-6" aria-hidden="true" />
+                  ) : (
+                    <MenuIcon className="block h-6 w-6" aria-hidden="true" />
+                  )}
+                </Disclosure.Button>
+              </div>
+              <div className="flex-1 flex items-center justify-center sm:items-stretch sm:justify-start">
+                <div className="flex-shrink-0 flex items-center">
+                  <Link to="/" className="text-white font-bold text-xl">RyzeNRTax</Link>
+                </div>
+                <div className="hidden sm:block sm:ml-6">
+                  <div className="flex space-x-4">
+                    {navigation.map((item) => (
+                      <Link
+                        key={item.name}
+                        to={item.to}
+                        className={classNames(
+                          item.current ? 'bg-primary-900 text-white' : 'text-gray-200 hover:bg-primary-700 hover:text-white',
+                          'px-3 py-2 rounded-md text-sm font-medium'
+                        )}
+                        aria-current={item.current ? 'page' : undefined}
+                      >
+                        {item.name}
+                      </Link>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <div className="absolute inset-y-0 right-0 flex items-center pr-2 sm:static sm:inset-auto sm:ml-6 sm:pr-0">
+                {user ? (
+                  <Menu as="div" className="ml-3 relative">
+                    <div>
+                      <Menu.Button className="bg-primary-800 flex text-sm rounded-full focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-primary-800 focus:ring-white">
+                        <span className="sr-only">Open user menu</span>
+                        <UserCircleIcon className="h-8 w-8 text-white" aria-hidden="true" />
+                      </Menu.Button>
+                    </div>
+                    <Transition
+                      enter="transition ease-out duration-100"
+                      enterFrom="transform opacity-0 scale-95"
+                      enterTo="transform opacity-100 scale-100"
+                      leave="transition ease-in duration-75"
+                      leaveFrom="transform opacity-100 scale-100"
+                      leaveTo="transform opacity-0 scale-95"
+                    >
+                      <Menu.Items className="origin-top-right absolute right-0 mt-2 w-48 rounded-md shadow-lg py-1 bg-white ring-1 ring-black ring-opacity-5 focus:outline-none">
+                        <Menu.Item>
+                          {({ active }) => (
+                            <Link
+                              to="/profile"
+                              className={classNames(active ? 'bg-gray-100' : '', 'block px-4 py-2 text-sm text-gray-700')}
+                            >
+                              Your Profile
+                            </Link>
+                          )}
+                        </Menu.Item>
+                        <Menu.Item>
+                          {({ active }) => (
+                            <Link
+                              to="/consultations"
+                              className={classNames(active ? 'bg-gray-100' : '', 'block px-4 py-2 text-sm text-gray-700')}
+                            >
+                              Consultations
+                            </Link>
+                          )}
+                        </Menu.Item>
+                        <Menu.Item>
+                          {({ active }) => (
+                            <button
+                              onClick={logout}
+                              className={classNames(active ? 'bg-gray-100' : '', 'block w-full text-left px-4 py-2 text-sm text-gray-700')}
+                            >
+                              Sign out
+                            </button>
+                          )}
+                        </Menu.Item>
+                      </Menu.Items>
+                    </Transition>
+                  </Menu>
+                ) : (
+                  <div className="flex space-x-4">
+                    <Link
+                      to="/login"
+                      className="text-gray-200 hover:bg-primary-700 hover:text-white px-3 py-2 rounded-md text-sm font-medium"
+                    >
+                      Login
+                    </Link>
+                    <Link
+                      to="/register"
+                      className="bg-white text-primary-600 hover:bg-gray-100 px-3 py-2 rounded-md text-sm font-medium"
+                    >
+                      Register
+                    </Link>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <Disclosure.Panel className="sm:hidden">
+            <div className="px-2 pt-2 pb-3 space-y-1">
+              {navigation.map((item) => (
+                <Disclosure.Button
+                  key={item.name}
+                  as={Link}
+                  to={item.to}
+                  className={classNames(
+                    item.current ? 'bg-primary-900 text-white' : 'text-gray-200 hover:bg-primary-700 hover:text-white',
+                    'block px-3 py-2 rounded-md text-base font-medium'
+                  )}
+                  aria-current={item.current ? 'page' : undefined}
+                >
+                  {item.name}
+                </Disclosure.Button>
+              ))}
+            </div>
+          </Disclosure.Panel>
+        </>
+      )}
+    </Disclosure>
+  );
+};
+
+export default Header;
+EOF
+
+# Create a basic Footer component
+cat > src/components/Footer.js << 'EOF'
+import React from 'react';
+import { Link } from 'react-router-dom';
+
+const Footer = () => {
+  return (
+    <footer className="bg-primary-800 text-white">
+      <div className="max-w-7xl mx-auto py-12 px-4 overflow-hidden sm:px-6 lg:px-8">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+          <div>
+            <h3 className="text-lg font-semibold mb-4">RyzeNRTax</h3>
+            <p className="text-gray-300 text-sm">
+              Helping non-residents navigate US tax laws with confidence and clarity.
+            </p>
+          </div>
+          <div>
+            <h3 className="text-lg font-semibold mb-4">Quick Links</h3>
+            <ul className="space-y-2">
+              <li>
+                <Link to="/tax-guides" className="text-gray-300 hover:text-white text-sm">
+                  Tax Guides
+                </Link>
+              </li>
+              <li>
+                <Link to="/faqs" className="text-gray-300 hover:text-white text-sm">
+                  FAQs
+                </Link>
+              </li>
+              <li>
+                <Link to="/pricing" className="text-gray-300 hover:text-white text-sm">
+                  Pricing
+                </Link>
+              </li>
+              <li>
+                <Link to="/about" className="text-gray-300 hover:text-white text-sm">
+                  About Us
+                </Link>
+              </li>
+            </ul>
+          </div>
+          <div>
+            <h3 className="text-lg font-semibold mb-4">Contact</h3>
+            <p className="text-gray-300 text-sm mb-2">
+              Have questions? Get in touch with our team.
+            </p>
+            <Link
+              to="/contact"
+              className="inline-block bg-white text-primary-800 px-4 py-2 rounded-md text-sm font-medium hover:bg-gray-100"
+            >
+              Contact Us
+            </Link>
+          </div>
+        </div>
+        <div className="mt-8 pt-8 border-t border-gray-700">
+          <p className="text-center text-gray-300 text-sm">
+            &copy; {new Date().getFullYear()} RyzeNRTax. All rights reserved.
+          </p>
+        </div>
+      </div>
+    </footer>
+  );
+};
+
+export default Footer;
+EOF
+
+# Create home page
+cat > src/pages/HomePage.js << 'EOF'
+import React from 'react';
+import { Link } from 'react-router-dom';
+
+const HomePage = () => {
+  return (
+    <div className="flex flex-col min-h-screen">
+      {/* Hero Section */}
+      <div className="bg-primary-800 text-white">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-20">
+          <div className="text-center max-w-3xl mx-auto">
+            <h1 className="text-4xl font-extrabold tracking-tight sm:text-5xl md:text-6xl">
+              Non-Resident Tax Solutions
+            </h1>
+            <p className="mt-6 text-xl">
+              Simplified tax guidance for international students, scholars, and professionals navigating the U.S. tax system.
+            </p>
+            <div className="mt-10 flex justify-center space-x-4">
+              <Link
+                to="/tax-guides"
+                className="inline-flex items-center justify-center px-5 py-3 border border-transparent text-base font-medium rounded-md bg-white text-primary-800 hover:bg-gray-100"
+              >
+                Browse Tax Guides
+              </Link>
+              <Link
+                to="/register"
+                className="inline-flex items-center justify-center px-5 py-3 border border-white text-base font-medium rounded-md text-white hover:bg-primary-700"
+              >
+                Create Account
+              </Link>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Features Section */}
+      <div className="py-12 bg-white">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="text-center">
+            <h2 className="text-3xl font-extrabold text-gray-900">
+              Why Choose RyzeNRTax?
+            </h2>
+          </div>
+
+          <div className="mt-10">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+              <div className="card text-center">
+                <div className="mx-auto flex items-center justify-center h-12 w-12 rounded-md bg-primary-600 text-white">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
+                  </svg>
+                </div>
+                <h3 className="mt-4 text-lg font-medium text-gray-900">Expert Guidance</h3>
+                <p className="mt-2 text-base text-gray-600">
+                  Access clear, accurate information tailored specifically to non-resident tax situations.
+                </p>
+              </div>
+
+              <div className="card text-center">
+                <div className="mx-auto flex items-center justify-center h-12 w-12 rounded-md bg-primary-600 text-white">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                </div>
+                <h3 className="mt-4 text-lg font-medium text-gray-900">Tax Treaty Knowledge</h3>
+                <p className="mt-2 text-base text-gray-600">
+                  Understand how international tax treaties affect your specific situation and tax obligations.
+                </p>
+              </div>
+
+              <div className="card text-center">
+                <div className="mx-auto flex items-center justify-center h-12 w-12 rounded-md bg-primary-600 text-white">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 8h2a2 2 0 012 2v6a2 2 0 01-2 2h-2v4l-4-4H9a1.994 1.994 0 01-1.414-.586m0 0L11 14h4a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2v4l.586-.586z" />
+                  </svg>
+                </div>
+                <h3 className="mt-4 text-lg font-medium text-gray-900">Personalized Consultation</h3>
+                <p className="mt-2 text-base text-gray-600">
+                  Get customized advice for your unique tax circumstances from our team of experienced professionals.
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Featured Tax Guides */}
+      <div className="py-12 bg-gray-50">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="text-center">
+            <h2 className="text-3xl font-extrabold text-gray-900">
+              Featured Tax Guides
+            </h2>
+            <p className="mt-4 max-w-2xl text-xl text-gray-600 mx-auto">
+              Browse our most popular resources for non-resident taxpayers
+            </p>
+          </div>
+
+          <div className="mt-10 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+            <div className="card hover:shadow-lg transition-shadow duration-300">
+              <h3 className="text-lg font-medium text-gray-900">US-China Tax Treaty Overview</h3>
+              <p className="mt-2 text-base text-gray-600">
+                Learn how the US-China tax treaty affects your tax obligations and benefits.
+              </p>
+              <div className="mt-4">
+                <Link to="/tax-guides/1" className="text-primary-600 hover:text-primary-700">
+                  Read More →
+                </Link>
+              </div>
+            </div>
+
+            <div className="card hover:shadow-lg transition-shadow duration-300">
+              <h3 className="text-lg font-medium text-gray-900">Form 1040-NR Guide</h3>
+              <p className="mt-2 text-base text-gray-600">
+                Step-by-step guidance on completing Form 1040-NR for non-resident taxpayers.
+              </p>
+              <div className="mt-4">
+                <Link to="/tax-guides/2" className="text-primary-600 hover:text-primary-700">
+                  Read More →
+                </Link>
+              </div>
+            </div>
+
+            <div className="card hover:shadow-lg transition-shadow duration-300">
+              <h3 className="text-lg font-medium text-gray-900">Scholarship Taxation</h3>
+              <p className="mt-2 text-base text-gray-600">
+                Understanding how scholarships and fellowships are taxed for non-residents.
+              </p>
+              <div className="mt-4">
+                <Link to="/tax-guides/3" className="text-primary-600 hover:text-primary-700">
+                  Read More →
+                </Link>
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-12 text-center">
+            <Link
+              to="/tax-guides"
+              className="inline-flex items-center justify-center px-5 py-3 border border-transparent text-base font-medium rounded-md text-white bg-primary-600 hover:bg-primary-700"
+            >
+              View All Tax Guides
+            </Link>
+          </div>
+        </div>
+      </div>
+
+      {/* Testimonials/CTA Section */}
+      <div className="py-12 bg-primary-700 text-white">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
+          <h2 className="text-3xl font-extrabold">
+            Ready to simplify your US tax filing?
+          </h2>
+          <p className="mt-4 text-xl">
+            Join thousands of international students and professionals who trust RyzeNRTax.
+          </p>
+          <div className="mt-8">
+            <Link
+              to="/register"
+              className="inline-flex items-center justify-center px-5 py-3 border border-transparent text-base font-medium rounded-md bg-white text-primary-700 hover:bg-gray-100"
+            >
+              Sign Up for Free
+            </Link>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default HomePage;
+EOF
+
+# Create Login page
+cat > src/pages/LoginPage.js << 'EOF'
+import React, { useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+
+const LoginPage = () => {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [errorMessage, setErrorMessage] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const { login } = useAuth();
+  const navigate = useNavigate();
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setIsLoading(true);
+    setErrorMessage('');
+
+    try {
+      await login(email, password);
+      navigate('/');
+    } catch (error) {
+      console.error('Login error:', error);
+      setErrorMessage(error.response?.data?.detail || 'Failed to login. Please check your credentials.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gray-50 py-12 px-4 sm:px-6 lg:px-8">
+      <div className="max-w-md w-full space-y-8">
+        <div>
+          <h2 className="mt-6 text-center text-3xl font-extrabold text-gray-900">Sign in to your account</h2>
+          <p className="mt-2 text-center text-sm text-gray-600">
+            Or{' '}
+            <Link to="/register" className="font-medium text-primary-600 hover:text-primary-500">
+              create a new account
+            </Link>
+          </p>
+        </div>
+        <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
+          {errorMessage && (
+            <div className="rounded-md bg-red-50 p-4">
+              <div className="text-sm text-red-700">{errorMessage}</div>
+            </div>
+          )}
+          <div className="rounded-md shadow-sm -space-y-px">
+            <div>
+              <label htmlFor="email-address" className="sr-only">
+                Email address
+              </label>
+              <input
+                id="email-address"
+                name="email"
+                type="email"
+                autoComplete="email"
+                required
+                className="appearance-none rounded-none relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-t-md focus:outline-none focus:ring-primary-500 focus:border-primary-500 focus:z-10 sm:text-sm"
+                placeholder="Email address"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+              />
+            </div>
+            <div>
+              <label htmlFor="password" className="sr-only">
+                Password
+              </label>
+              <input
+                id="password"
+                name="password"
+                type="password"
+                autoComplete="current-password"
+                required
+                className="appearance-none rounded-none relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-b-md focus:outline-none focus:ring-primary-500 focus:border-primary-500 focus:z-10 sm:text-sm"
+                placeholder="Password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+              />
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between">
+            <div className="text-sm">
+              <Link to="/forgot-password" className="font-medium text-primary-600 hover:text-primary-500">
+                Forgot your password?
+              </Link>
+            </div>
+          </div>
+
+          <div>
+            <button
+              type="submit"
+              disabled={isLoading}
+              className="group relative w-full flex justify-center py-2 px-4 border border-transparent text-sm font-medium rounded-md text-white bg-primary-600 hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500"
+            >
+              {isLoading ? 'Signing in...' : 'Sign in'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+};
+
+export default LoginPage;
+EOF
+
+# Create Registration page
+cat > src/pages/RegisterPage.js << 'EOF'
+import React, { useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { register } from '../services/api';
+import { useAuth } from '../context/AuthContext';
+
+const RegisterPage = () => {
+  const [formData, setFormData] = useState({
+    email: '',
+    password: '',
+    confirmPassword: '',
+  });
+  const [errors, setErrors] = useState({});
+  const [isLoading, setIsLoading] = useState(false);
+  const [serverError, setServerError] = useState('');
+  const navigate = useNavigate();
+  const { login } = useAuth();
+
+  const handleChange = (e) => {
+    const { name, value } = e.target;
+    setFormData({
+      ...formData,
+      [name]: value,
+    });
+  };
+
+  const validateForm = () => {
+    const newErrors = {};
+    if (!formData.email) newErrors.email = 'Email is required';
+    else if (!/\S+@\S+\.\S+/.test(formData.email)) newErrors.email = 'Email is invalid';
+
+    if (!formData.password) newErrors.password = 'Password is required';
+    else if (formData.password.length < 8) newErrors.password = 'Password must be at least 8 characters';
+
+    if (formData.password !== formData.confirmPassword) {
+      newErrors.confirmPassword = 'Passwords do not match';
+    }
+
+    setErrors(newErrors);
+    return Object.keys(newErrors).length === 0;
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (validateForm()) {
+      setIsLoading(true);
+      setServerError('');
+
+      try {
+        await register({
+          email: formData.email,
+          password: formData.password,
+        });
+        
+        // Automatically log in after registration
+        await login(formData.email, formData.password);
+        navigate('/');
+      } catch (error) {
+        console.error('Registration error:', error);
+        setServerError(error.response?.data?.detail || 'Registration failed. Please try again.');
+      } finally {
+        setIsLoading(false);
+      }
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gray-50 py-12 px-4 sm:px-6 lg:px-8">
+      <div className="max-w-md w-full space-y-8">
+        <div>
+          <h2 className="mt-6 text-center text-3xl font-extrabold text-gray-900">Create your account</h2>
+          <p className="mt-2 text-center text-sm text-gray-600">
+            Or{' '}
+            <Link to="/login" className="font-medium text-primary-600 hover:text-primary-500">
+              sign in to your existing account
+            </Link>
+          </p>
+        </div>
+        <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
+          {serverError && (
+            <div className="rounded-md bg-red-50 p-4">
+              <div className="text-sm text-red-700">{serverError}</div>
+            </div>
+          )}
+          <div className="rounded-md shadow-sm -space-y-px">
+            <div>
+              <label htmlFor="email-address" className="sr-only">
+                Email address
+              </label>
+              <input
+                id="email-address"
+                name="email"
+                type="email"
+                autoComplete="email"
+                required
+                className={`appearance-none rounded-none relative block w-full px-3 py-2 border ${
+                  errors.email ? 'border-red-300' : 'border-gray-300'
+                } placeholder-gray-500 text-gray-900 rounded-t-md focus:outline-none focus:ring-primary-500 focus:border-primary-500 focus:z-10 sm:text-sm`}
+                placeholder="Email address"
+                value={formData.email}
+                onChange={handleChange}
+              />
+              {errors.email && <p className="mt-1 text-sm text-red-600">{errors.email}</p>}
+            </div>
+            <div>
+              <label htmlFor="password" className="sr-only">
+                Password
+              </label>
+              <input
+                id="password"
+                name="password"
+                type="password"
+                autoComplete="new-password"
+                required
+                className={`appearance-none rounded-none relative block w-full px-3 py-2 border ${
+                  errors.password ? 'border-red-300' : 'border-gray-300'
+                } placeholder-gray-500 text-gray-900 focus:outline-none focus:ring-primary-500 focus:border-primary-500 focus:z-10 sm:text-sm`}
+                placeholder="Password"
+                value={formData.password}
+                onChange={handleChange}
+              />
+              {errors.password && <p className="mt-1 text-sm text-red-600">{errors.password}</p>}
+            </div>
+            <div>
+              <label htmlFor="confirmPassword" className="sr-only">
+                Confirm Password
+              </label>
+              <input
+                id="confirmPassword"
+                name="confirmPassword"
+                type="password"
+                autoComplete="new-password"
+                required
+                className={`appearance-none rounded-none relative block w-full px-3 py-2 border ${
+                  errors.confirmPassword ? 'border-red-300' : 'border-gray-300'
+                } placeholder-gray-500 text-gray-900 rounded-b-md focus:outline-none focus:ring-primary-500 focus:border-primary-500 focus:z-10 sm:text-sm`}
+                placeholder="Confirm Password"
+                value={formData.confirmPassword}
+                onChange={handleChange}
+              />
+              {errors.confirmPassword && (
+                <p className="mt-1 text-sm text-red-600">{errors.confirmPassword}</p>
+              )}
+            </div>
+          </div>
+
+          <div>
+            <button
+              type="submit"
+              disabled={isLoading}
+              className="group relative w-full flex justify-center py-2 px-4 border border-transparent text-sm font-medium rounded-md text-white bg-primary-600 hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500"
+            >
+              {isLoading ? 'Creating Account...' : 'Create Account'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+};
+
+export default RegisterPage;
+EOF
+
+# Continuing with the TaxGuidesPage.js
+cat > src/pages/TaxGuidesPage.js << 'EOF'
+import React, { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
+import { getTaxGuides } from '../services/api';
+import { useAuth } from '../context/AuthContext';
+
+const TaxGuidesPage = () => {
+  const [guides, setGuides] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const { user } = useAuth();
+
+  useEffect(() => {
+    const fetchGuides = async () => {
+      try {
+        const response = await getTaxGuides();
+        setGuides(response.data);
+        setLoading(false);
+      } catch (err) {
+        console.error('Error fetching tax guides:', err);
+        setError('Failed to load tax guides. Please try again later.');
+        setLoading(false);
+      }
+    };
+
+    fetchGuides();
+  }, []);
+
+  return (
+    <div className="bg-white py-8">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div className="text-center">
+          <h1 className="text-3xl font-extrabold text-gray-900 sm:text-4xl">
+            Non-Resident Tax Guides
+          </h1>
+          <p className="mt-3 max-w-2xl mx-auto text-xl text-gray-500 sm:mt-4">
+            Comprehensive resources to help you understand and navigate U.S. tax laws for non-residents.
+          </p>
+        </div>
+
+        {loading ? (
+          <div className="text-center py-10">
+            <p>Loading tax guides...</p>
+          </div>
+        ) : error ? (
+          <div className="text-center py-10">
+            <p className="text-red-600">{error}</p>
+          </div>
+        ) : (
+          <div className="mt-12 grid gap-8 md:grid-cols-2 lg:grid-cols-3">
+            {guides.map((guide) => (
+              <div key={guide.id} className="card hover:shadow-lg transition-shadow duration-300">
+                <h2 className="text-xl font-semibold text-gray-900">{guide.title}</h2>
+                <p className="mt-2 text-gray-600 line-clamp-3">
+                  {guide.content.substring(0, 150)}...
+                </p>
+                {guide.is_premium && !user?.is_premium ? (
+                  <div className="mt-4 flex items-center">
+                    <span className="bg-yellow-100 text-yellow-800 px-2 py-1 text-xs font-medium rounded-md mr-2">
+                      Premium
+                    </span>
+                    <Link
+                      to="/pricing"
+                      className="text-primary-600 hover:text-primary-700"
+                    >
+                      Upgrade to access
+                    </Link>
+                  </div>
+                ) : (
+                  <div className="mt-4">
+                    <Link
+                      to={`/tax-guides/${guide.id}`}
+                      className="text-primary-600 hover:text-primary-700"
+                    >
+                      Read More →
+                    </Link>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {!user?.is_premium && (
+          <div className="mt-16 bg-primary-50 rounded-lg p-6 text-center">
+            <h2 className="text-2xl font-bold text-primary-800">
+              Unlock Premium Tax Guides
+            </h2>
+            <p className="mt-2 text-primary-700">
+              Get access to advanced tax guidance, personalized consultations, and more.
+            </p>
+            <div className="mt-4">
+              <Link
+                to="/pricing"
+                className="inline-flex items-center justify-center px-5 py-3 border border-transparent text-base font-medium rounded-md text-white bg-primary-600 hover:bg-primary-700"
+              >
+                View Pricing Plans
+              </Link>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default TaxGuidesPage;
+EOF
+
+# Create TaxGuideDetailPage
+cat > src/pages/TaxGuideDetailPage.js << 'EOF'
+import React, { useState, useEffect } from 'react';
+import { useParams, Link, useNavigate } from 'react-router-dom';
+import { getTaxGuide } from '../services/api';
+import { useAuth } from '../context/AuthContext';
+
+const TaxGuideDetailPage = () => {
+  const { id } = useParams();
+  const [guide, setGuide] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const { user } = useAuth();
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    const fetchGuide = async () => {
+      try {
+        const response = await getTaxGuide(id);
+        setGuide(response.data);
+        setLoading(false);
+      } catch (err) {
+        console.error('Error fetching tax guide:', err);
+        if (err.response?.status === 403) {
+          setError('This content requires a premium subscription');
+        } else {
+          setError('Failed to load the tax guide. Please try again later.');
+        }
+        setLoading(false);
+      }
+    };
+
+    fetchGuide();
+  }, [id]);
+
+  if (loading) {
+    return (
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10 text-center">
+        <p>Loading tax guide...</p>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
+        <div className="bg-red-50 border-l-4 border-red-400 p-4">
+          <div className="flex">
+            <div className="flex-shrink-0">
+              <svg className="h-5 w-5 text-red-400" fill="currentColor" viewBox="0 0 20 20">
+                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+              </svg>
+            </div>
+            <div className="ml-3">
+              <p className="text-sm text-red-700">{error}</p>
+              {error.includes('premium') && (
+                <div className="mt-4">
+                  <Link
+                    to="/pricing"
+                    className="text-sm font-medium text-red-700 hover:text-red-600"
+                  >
+                    View Premium Plans →
+                  </Link>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!guide) {
+    return (
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10 text-center">
+        <p>Tax guide not found.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-white py-8">
+      <div className="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div className="mb-6">
+          <button
+            onClick={() => navigate(-1)}
+            className="text-primary-600 hover:text-primary-800 flex items-center"
+          >
+            <svg className="h-5 w-5 mr-1" fill="currentColor" viewBox="0 0 20 20">
+              <path fillRule="evenodd" d="M9.707 16.707a1 1 0 01-1.414 0l-6-6a1 1 0 010-1.414l6-6a1 1 0 011.414 1.414L5.414 9H17a1 1 0 110 2H5.414l4.293 4.293a1 1 0 010 1.414z" clipRule="evenodd" />
+            </svg>
+            Back to Tax Guides
+          </button>
+        </div>
+
+        <div className="prose prose-lg max-w-none">
+          <h1>{guide.title}</h1>
+          {guide.is_premium && (
+            <div className="inline-flex items-center px-2.5 py-0.5 rounded-md text-sm font-medium bg-yellow-100 text-yellow-800 mb-4">
+              Premium Content
+            </div>
+          )}
+          <div className="mt-6">
+            {guide.content.split('\n').map((paragraph, idx) => (
+              <p key={idx}>{paragraph}</p>
+            ))}
+          </div>
+        </div>
+
+        <div className="mt-12 pt-8 border-t border-gray-200">
+          <h2 className="text-xl font-semibold text-gray-900">Have Questions?</h2>
+          <p className="mt-2 text-gray-600">
+            Our tax experts are available to provide personalized guidance for your specific situation.
+          </p>
+          <div className="mt-4">
+            {user ? (
+              <Link
+                to="/consultations/new"
+                className="inline-flex items-center px-4 py-2 border border-transparent text-base font-medium rounded-md shadow-sm text-white bg-primary-600 hover:bg-primary-700"
+              >
+                Schedule a Consultation
+              </Link>
+            ) : (
+              <div className="space-x-4">
+                <Link
+                  to="/login"
+                  className="inline-flex items-center px-4 py-2 border border-transparent text-base font-medium rounded-md text-primary-700 bg-primary-100 hover:bg-primary-200"
+                >
+                  Login
+                </Link>
+                <Link
+                  to="/register"
+                  className="inline-flex items-center px-4 py-2 border border-transparent text-base font-medium rounded-md shadow-sm text-white bg-primary-600 hover:bg-primary-700"
+                >
+                  Sign Up
+                </Link>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default TaxGuideDetailPage;
+EOF
+
+# Create FAQs page
+cat > src/pages/FAQsPage.js << 'EOF'
+import React, { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
+import { getFaqs } from '../services/api';
+import { useAuth } from '../context/AuthContext';
+
+const FAQsPage = () => {
+  const [faqs, setFaqs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [activeCategory, setActiveCategory] = useState('all');
+  const { user } = useAuth();
+
+  useEffect(() => {
+    const fetchFaqs = async () => {
+      try {
+        const response = await getFaqs();
+        setFaqs(response.data);
+        setLoading(false);
+      } catch (err) {
+        console.error('Error fetching FAQs:', err);
+        setError('Failed to load FAQs. Please try again later.');
+        setLoading(false);
+      }
+    };
+
+    fetchFaqs();
+  }, []);
+
+  // Get unique categories
+  const categories = ['all', ...new Set(faqs.map(faq => faq.category))];
+
+  // Filter FAQs by category
+  const filteredFaqs = activeCategory === 'all' 
+    ? faqs 
+    : faqs.filter(faq => faq.category === activeCategory);
+
+  return (
+    <div className="bg-white py-8">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div className="text-center">
+          <h1 className="text-3xl font-extrabold text-gray-900 sm:text-4xl">
+            Frequently Asked Questions
+          </h1>
+          <p className="mt-3 max-w-2xl mx-auto text-xl text-gray-500 sm:mt-4">
+            Find answers to common questions about non-resident tax obligations in the U.S.
+          </p>
+        </div>
+
+        {loading ? (
+          <div className="text-center py-10">
+            <p>Loading FAQs...</p>
+          </div>
+        ) : error ? (
+          <div className="text-center py-10">
+            <p className="text-red-600">{error}</p>
+          </div>
+        ) : (
+          <div className="mt-12">
+            {/* Category filters */}
+            <div className="flex flex-wrap gap-2 mb-8 justify-center">
+              {categories.map(category => (
+                <button
+                  key={category}
+                  className={`px-4 py-2 rounded-full text-sm font-medium ${
+                    activeCategory === category
+                      ? 'bg-primary-600 text-white'
+                      : 'bg-gray-100 text-gray-800 hover:bg-gray-200'
+                  }`}
+                  onClick={() => setActiveCategory(category)}
+                >
+                  {category.charAt(0).toUpperCase() + category.slice(1)}
+                </button>
+              ))}
+            </div>
+
+            {/* FAQs */}
+            <div className="space-y-6">
+              {filteredFaqs.map((faq) => (
+                <div key={faq.id} className="card">
+                  <h3 className="text-lg font-medium text-gray-900 flex items-start">
+                    <span className="text-primary-600 mr-2">Q:</span>
+                    <span>{faq.question}</span>
+                    {faq.is_premium && !user?.is_premium && (
+                      <span className="bg-yellow-100 text-yellow-800 px-2 py-1 text-xs font-medium rounded-md ml-2">
+                        Premium
+                      </span>
+                    )}
+                  </h3>
+                  {faq.is_premium && !user?.is_premium ? (
+                    <div className="mt-4 ml-6">
+                      <p className="text-gray-600">
+                        This answer is available with a premium subscription.
+                      </p>
+                      <Link
+                        to="/pricing"
+                        className="mt-2 inline-block text-primary-600 hover:text-primary-700"
+                      >
+                        Upgrade to access
+                      </Link>
+                    </div>
+                  ) : (
+                    <p className="mt-2 text-gray-600 ml-6">
+                      <span className="text-primary-600 mr-2">A:</span>
+                      {faq.answer}
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="mt-16 bg-gray-50 rounded-lg p-6 text-center">
+          <h2 className="text-2xl font-bold text-gray-900">
+            Still have questions?
+          </h2>
+          <p className="mt-2 text-gray-600">
+            Our tax experts are ready to help with your specific concerns.
+          </p>
+          <div className="mt-4">
+            {user ? (
+              <Link
+                to="/consultations/new"
+                className="inline-flex items-center justify-center px-5 py-3 border border-transparent text-base font-medium rounded-md text-white bg-primary-600 hover:bg-primary-700"
+              >
+                Request a Consultation
+              </Link>
+            ) : (
+              <div className="space-x-4">
+                <Link
+                  to="/login"
+                  className="inline-flex items-center px-4 py-2 border border-transparent text-base font-medium rounded-md text-primary-700 bg-primary-100 hover:bg-primary-200"
+                >
+                  Login
+                </Link>
+                <Link
+                  to="/register"
+                  className="inline-flex items-center px-4 py-2 border border-transparent text-base font-medium rounded-md shadow-sm text-white bg-primary-600 hover:bg-primary-700"
+                >
+                  Sign Up
+                </Link>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default FAQsPage;
+EOF
+
+# Create Pricing page
+cat > src/pages/PricingPage.js << 'EOF'
+import React from 'react';
+import { Link } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+
+const PricingPage = () => {
+  const { user } = useAuth();
+
+  const features = {
+    free: [
+      'Access to basic tax guides',
+      'General FAQ answers',
+      'Understanding tax forms',
+      'Basic treaty information',
+    ],
+    premium: [
+      'All Free features',
+      'Advanced tax planning guides',
+      'Premium FAQ content',
+      'Tax liability calculators',
+      'Personalized tax consultations',
+      'Document review service',
+      'Priority support',
+    ],
+  };
+
+  return (
+    <div className="bg-gray-50 py-12">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div className="text-center">
+          <h1 className="text-3xl font-extrabold text-gray-900 sm:text-4xl">
+            Simple, Transparent Pricing
+          </h1>
+          <p className="mt-3 max-w-2xl mx-auto text-xl text-gray-500 sm:mt-4">
+            Choose the plan that works best for your non-resident tax needs
+          </p>
+        </div>
+
+        <div className="mt-12 space-y-4 sm:mt-16 sm:space-y-0 sm:grid sm:grid-cols-2 sm:gap-6 lg:max-w-4xl lg:mx-auto xl:max-w-none xl:mx-0 xl:grid-cols-2">
+          {/* Free Plan */}
+          <div className="border border-gray-200 rounded-lg shadow-sm divide-y divide-gray-200 bg-white">
+            <div className="p-6">
+              <h2 className="text-lg leading-6 font-medium text-gray-900">Free</h2>
+              <p className="mt-4 text-sm text-gray-500">
+                Essential resources for understanding non-resident tax basics.
+              </p>
+              <p className="mt-8">
+                <span className="text-4xl font-extrabold text-gray-900">$0</span>
+                <span className="text-base font-medium text-gray-500">/mo</span>
+              </p>
+              <Link
+                to={user ? '/' : '/register'}
+                className="mt-8 block w-full bg-primary-50 border border-primary-100 rounded-md py-2 text-sm font-semibold text-primary-700 text-center hover:bg-primary-100"
+              >
+                {user ? 'Current Plan' : 'Get Started'}
+              </Link>
+            </div>
+            <div className="pt-6 pb-8 px-6">
+              <h3 className="text-xs font-medium text-gray-900 tracking-wide uppercase">
+                What's included
+              </h3>
+              <ul role="list" className="mt-6 space-y-4">
+                {features.free.map((feature) => (
+                  <li key={feature} className="flex space-x-3">
+                    <svg
+                      className="flex-shrink-0 h-5 w-5 text-green-500"
+                      xmlns="http://www.w3.org/2000/svg"
+                      viewBox="0 0 20 20"
+                      fill="currentColor"
+                      aria-hidden="true"
+                    >
+                      <path
+                        fillRule="evenodd"
+                        d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"
+                        clipRule="evenodd"
+                      />
+                    </svg>
+                    <span className="text-sm text-gray-500">{feature}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+
+          {/* Premium Plan */}
+          <div className="border border-primary-200 rounded-lg shadow-sm divide-y divide-gray-200 bg-white">
+            <div className="p-6 bg-primary-50 rounded-t-lg">
+              <h2 className="text-lg leading-6 font-medium text-primary-900">Premium</h2>
+              <p className="mt-4 text-sm text-primary-700">
+                Advanced guidance and personalized support for your tax situation.
+              </p>
+              <p className="mt-8">
+                <span className="text-4xl font-extrabold text-primary-900">$29.99</span>
+                <span className="text-base font-medium text-primary-700">/mo</span>
+              </p>
+              {user?.is_premium ? (
+                <button
+                  disabled
+                  className="mt-8 block w-full bg-primary-600 border border-transparent rounded-md py-2 text-sm font-semibold text-white text-center opacity-75"
+                >
+                  Current Plan
+                </button>
+              ) : user ? (
+                <Link
+                  to="/upgrade"
+                  className="mt-8 block w-full bg-primary-600 border border-transparent rounded-md py-2 text-sm font-semibold text-white text-center hover:bg-primary-700"
+                >
+                  Upgrade Now
+                </Link>
+              ) : (
+                <Link
+                  to="/register"
+                  className="mt-8 block w-full bg-primary-600 border border-transparent rounded-md py-2 text-sm font-semibold text-white text-center hover:bg-primary-700"
+                >
+                  Get Started
+                </Link>
+              )}
+            </div>
+            <div className="pt-6 pb-8 px-6">
+              <h3 className="text-xs font-medium text-gray-900 tracking-wide uppercase">
+                What's included
+              </h3>
+              <ul role="list" className="mt-6 space-y-4">
+                {features.premium.map((feature) => (
+                  <li key={feature} className="flex space-x-3">
+                    <svg
+                      className="flex-shrink-0 h-5 w-5 text-green-500"
+                      xmlns="http://www.w3.org/2000/svg"
+                      viewBox="0 0 20 20"
+                      fill="currentColor"
+                      aria-hidden="true"
+                    >
+                      <path
+                        fillRule="evenodd"
+                        d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"
+                        clipRule="evenodd"
+                      />
+                    </svg>
+                    <span className="text-sm text-gray-500">{feature}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-12 bg-white rounded-lg shadow-md p-8">
+          <h2 className="text-2xl font-bold text-gray-900 text-center">
+            Frequently Asked Questions
+          </h2>
+          <dl className="mt-6 space-y-6 divide-y divide-gray-200">
+            <div className="pt-6">
+              <dt className="text-lg font-medium text-gray-900">
+                What payment methods do you accept?
+              </dt>
+              <dd className="mt-2 text-base text-gray-500">
+                We accept all major credit cards, PayPal, and bank transfers for premium subscriptions.
+              </dd>
+            </div>
+
+            <div className="pt-6">
+              <dt className="text-lg font-medium text-gray-900">
+                Can I cancel my subscription at any time?
+              </dt>
+              <dd className="mt-2 text-base text-gray-500">
+                Yes, you can cancel your premium subscription at any time. Your premium access will remain until the end of your billing period.
+              </dd>
+            </div>
+
+            <div className="pt-6">
+              <dt className="text-lg font-medium text-gray-900">
+                How does the consultation service work?
+              </dt>
+              <dd className="mt-2 text-base text-gray-500">
+                Premium members can schedule up to two 30-minute consultations per month with our tax experts. Consultations can be conducted via video call or phone.
+              </dd>
+            </div>
+
+            <div className="pt-6">
+              <dt className="text-lg font-medium text-gray-900">
+                Is my information secure?
+              </dt>
+              <dd className="mt-2 text-base text-gray-500">
+                Yes, we use industry-standard encryption and security practices to protect your personal and financial information.
+              </dd>
+            </div>
+          </dl>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default PricingPage;
+EOF
+
+# Continuing with the ConsultationFormPage.js
+cat > src/pages/ConsultationFormPage.js << 'EOF'
+import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { createConsultation } from '../services/api';
+import { useAuth } from '../context/AuthContext';
+
+const ConsultationFormPage = () => {
+  const [formData, setFormData] = useState({
+    subject: '',
+    message: '',
+  });
+  const [errors, setErrors] = useState({});
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState('');
+  const navigate = useNavigate();
+  const { user } = useAuth();
+
+  const handleChange = (e) => {
+    const { name, value } = e.target;
+    setFormData({
+      ...formData,
+      [name]: value,
+    });
+  };
+
+  const validateForm = () => {
+    const newErrors = {};
+    if (!formData.subject.trim()) newErrors.subject = 'Subject is required';
+    if (!formData.message.trim()) newErrors.message = 'Message is required';
+    else if (formData.message.trim().length < 20) {
+      newErrors.message = 'Message should be at least 20 characters';
+    }
+
+    setErrors(newErrors);
+    return Object.keys(newErrors).length === 0;
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (validateForm()) {
+      setIsSubmitting(true);
+      setSubmitError('');
+
+      try {
+        await createConsultation(formData);
+        navigate('/consultations');
+      } catch (error) {
+        console.error('Error creating consultation:', error);
+        setSubmitError(
+          error.response?.data?.detail || 'Failed to submit consultation request. Please try again.'
+        );
+      } finally {
+        setIsSubmitting(false);
+      }
+    }
+  };
+
+  if (!user) {
+    navigate('/login');
+    return null;
+  }
+
+  return (
+    <div className="bg-white py-8">
+      <div className="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div className="text-center mb-8">
+          <h1 className="text-3xl font-extrabold text-gray-900">
+            Request a Tax Consultation
+          </h1>
+          <p className="mt-2 text-lg text-gray-600">
+            Submit your questions and our tax experts will help you navigate your non-resident tax situation.
+          </p>
+        </div>
+
+        <div className="bg-white shadow rounded-lg p-6">
+          {submitError && (
+            <div className="mb-6 bg-red-50 border-l-4 border-red-400 p-4">
+              <div className="flex">
+                <div className="flex-shrink-0">
+                  <svg className="h-5 w-5 text-red-400" fill="currentColor" viewBox="0 0 20 20">
+                    <path
+                      fillRule="evenodd"
+                      d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z"
+                      clipRule="evenodd"
+                    />
+                  </svg>
+                </div>
+                <div className="ml-3">
+                  <p className="text-sm text-red-700">{submitError}</p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <form onSubmit={handleSubmit}>
+            <div className="mb-6">
+              <label htmlFor="subject" className="block text-sm font-medium text-gray-700">
+                Subject
+              </label>
+              <input
+                type="text"
+                id="subject"
+                name="subject"
+                value={formData.subject}
+                onChange={handleChange}
+                className={`mt-1 block w-full rounded-md shadow-sm ${
+                  errors.subject
+                    ? 'border-red-300 focus:ring-red-500 focus:border-red-500'
+                    : 'border-gray-300 focus:ring-primary-500 focus:border-primary-500'
+                }`}
+                placeholder="e.g., Tax treaty questions, Scholarship taxation"
+              />
+              {errors.subject && <p className="mt-1 text-sm text-red-600">{errors.subject}</p>}
+            </div>
+
+            <div className="mb-6">
+              <label htmlFor="message" className="block text-sm font-medium text-gray-700">
+                Your Question or Concern
+              </label>
+              <textarea
+                id="message"
+                name="message"
+                rows="6"
+                value={formData.message}
+                onChange={handleChange}
+                className={`mt-1 block w-full rounded-md shadow-sm ${
+                  errors.message
+                    ? 'border-red-300 focus:ring-red-500 focus:border-red-500'
+                    : 'border-gray-300 focus:ring-primary-500 focus:border-primary-500'
+                }`}
+                placeholder="Please describe your tax situation and questions in detail..."
+              ></textarea>
+              {errors.message && <p className="mt-1 text-sm text-red-600">{errors.message}</p>}
+            </div>
+
+            <div className="bg-gray-50 p-4 rounded-md mb-6">
+              <div className="flex">
+                <div className="flex-shrink-0">
+                  <svg className="h-5 w-5 text-primary-400" fill="currentColor" viewBox="0 0 20 20">
+                    <path
+                      fillRule="evenodd"
+                      d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2h-1V9a1 1 0 00-1-1z"
+                      clipRule="evenodd"
+                    />
+                  </svg>
+                </div>
+                <div className="ml-3">
+                  <h3 className="text-sm font-medium text-primary-800">Information Notice</h3>
+                  <div className="mt-2 text-sm text-primary-700">
+                    <p>
+                      Our experts will review your question and respond within 1-2 business days. For complex situations, we may schedule a follow-up video or phone consultation.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex justify-end">
+              <button
+                type="button"
+                className="bg-white py-2 px-4 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 mr-3"
+                onClick={() => navigate(-1)}
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={isSubmitting}
+                className="inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-primary-600 hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500"
+              >
+                {isSubmitting ? 'Submitting...' : 'Submit Request'}
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default ConsultationFormPage;
+EOF
+
+# Create ConsultationsPage
+cat > src/pages/ConsultationsPage.js << 'EOF'
+import React, { useState, useEffect } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { getUserConsultations } from '../services/api';
+import { useAuth } from '../context/AuthContext';
+
+const ConsultationsPage = () => {
+  const [consultations, setConsultations] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const { user } = useAuth();
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    if (!user) {
+      navigate('/login');
+      return;
+    }
+
+    const fetchConsultations = async () => {
+      try {
+        const response = await getUserConsultations();
+        setConsultations(response.data);
+        setLoading(false);
+      } catch (err) {
+        console.error('Error fetching consultations:', err);
+        setError('Failed to load consultations. Please try again later.');
+        setLoading(false);
+      }
+    };
+
+    fetchConsultations();
+  }, [user, navigate]);
+
+  // Helper function to format date
+  const formatDate = (dateString) => {
+    const options = { year: 'numeric', month: 'long', day: 'numeric' };
+    return new Date(dateString).toLocaleDateString(undefined, options);
+  };
+
+  // Helper function to get status badge color
+  const getStatusBadgeColor = (status) => {
+    switch (status) {
+      case 'pending':
+        return 'bg-yellow-100 text-yellow-800';
+      case 'scheduled':
+        return 'bg-blue-100 text-blue-800';
+      case 'completed':
+        return 'bg-green-100 text-green-800';
+      default:
+        return 'bg-gray-100 text-gray-800';
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10 text-center">
+        <p>Loading your consultations...</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-white py-8">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div className="flex justify-between items-center mb-6">
+          <h1 className="text-2xl font-bold text-gray-900">Your Consultations</h1>
+          <Link
+            to="/consultations/new"
+            className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-primary-600 hover:bg-primary-700"
+          >
+            New Consultation
+          </Link>
+        </div>
+
+        {error ? (
+          <div className="text-center py-10">
+            <p className="text-red-600">{error}</p>
+          </div>
+        ) : consultations.length === 0 ? (
+          <div className="text-center py-10 bg-gray-50 rounded-lg">
+            <svg
+              className="mx-auto h-12 w-12 text-gray-400"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth="2"
+                d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"
+              ></path>
+            </svg>
+            <h3 className="mt-2 text-sm font-medium text-gray-900">No consultations</h3>
+            <p className="mt-1 text-sm text-gray-500">Get started by requesting a new consultation.</p>
+            <div className="mt-6">
+              <Link
+                to="/consultations/new"
+                className="inline-flex items-center px-4 py-2 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-primary-600 hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500"
+              >
+                <svg
+                  className="-ml-1 mr-2 h-5 w-5"
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 20 20"
+                  fill="currentColor"
+                  aria-hidden="true"
+                >
+                  <path
+                    fillRule="evenodd"
+                    d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z"
+                    clipRule="evenodd"
+                  />
+                </svg>
+                New Consultation
+              </Link>
+            </div>
+          </div>
+        ) : (
+          <div className="overflow-hidden shadow ring-1 ring-black ring-opacity-5 md:rounded-lg">
+            <table className="min-w-full divide-y divide-gray-300">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th
+                    scope="col"
+                    className="py-3.5 pl-4 pr-3 text-left text-sm font-semibold text-gray-900 sm:pl-6"
+                  >
+                    Subject
+                  </th>
+                  <th
+                    scope="col"
+                    className="px-3 py-3.5 text-left text-sm font-semibold text-gray-900"
+                  >
+                    Date
+                  </th>
+                  <th
+                    scope="col"
+                    className="px-3 py-3.5 text-left text-sm font-semibold text-gray-900"
+                  >
+                    Status
+                  </th>
+                  <th scope="col" className="relative py-3.5 pl-3 pr-4 sm:pr-6">
+                    <span className="sr-only">View</span>
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-200 bg-white">
+                {consultations.map((consultation) => (
+                  <tr key={consultation.id}>
+                    <td className="py-4 pl-4 pr-3 text-sm sm:pl-6">
+                      <div className="font-medium text-gray-900">{consultation.subject}</div>
+                      <div className="text-gray-500 line-clamp-1">{consultation.message.substring(0, 100)}...</div>
+                    </td>
+                    <td className="px-3 py-4 text-sm text-gray-500">
+                      {formatDate(consultation.created_at)}
+                    </td>
+                    <td className="px-3 py-4 text-sm text-gray-500">
+                      <span
+                        className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusBadgeColor(
+                          consultation.status
+                        )}`}
+                      >
+                        {consultation.status.charAt(0).toUpperCase() + consultation.status.slice(1)}
+                      </span>
+                    </td>
+                    <td className="py-4 pl-3 pr-4 text-right text-sm font-medium sm:pr-6">
+                      <Link
+                        to={`/consultations/${consultation.id}`}
+                        className="text-primary-600 hover:text-primary-900"
+                      >
+                        View
+                      </Link>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default ConsultationsPage;
+EOF
+
+# Create AboutPage
+cat > src/pages/AboutPage.js << 'EOF'
+import React from 'react';
+import { Link } from 'react-router-dom';
+
+const AboutPage = () => {
+  return (
+    <div className="bg-white py-8">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        {/* Hero section */}
+        <div className="text-center">
+          <h1 className="text-3xl font-extrabold text-gray-900 sm:text-4xl">
+            About RyzeNRTax
+          </h1>
+          <p className="mt-3 max-w-2xl mx-auto text-xl text-gray-500 sm:mt-4">
+            Dedicated to simplifying U.S. tax compliance for non-residents
+          </p>
+        </div>
+
+        {/* Mission section */}
+        <div className="mt-12 bg-primary-50 rounded-lg overflow-hidden shadow">
+          <div className="px-4 py-5 sm:p-6">
+            <h2 className="text-2xl font-bold text-primary-800 mb-4">Our Mission</h2>
+            <p className="text-primary-700">
+              At RyzeNRTax, we believe that navigating the complex U.S. tax system shouldn't be a barrier for international students, scholars, and professionals pursuing opportunities in the United States. Our mission is to provide clear, accessible, and reliable tax guidance to help non-residents confidently manage their U.S. tax obligations.
+            </p>
+          </div>
+        </div>
+
+        {/* What we do section */}
+        <div className="mt-12">
+          <h2 className="text-2xl font-bold text-gray-900 mb-6">What We Do</h2>
+          <div className="grid grid-cols-1 gap-8 md:grid-cols-3">
+            <div className="bg-white overflow-hidden shadow rounded-lg">
+              <div className="px-4 py-5 sm:p-6">
+                <div className="flex items-center justify-center h-12 w-12 rounded-md bg-primary-600 text-white mx-auto">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+                  </svg>
+                </div>
+                <h3 className="mt-4 text-lg font-medium text-gray-900 text-center">Educational Resources</h3>
+                <p className="mt-2 text-base text-gray-500 text-center">
+                  We create comprehensive tax guides tailored to non-resident situations, explaining complex concepts in clear, understandable language.
+                </p>
+              </div>
+            </div>
+
+            <div className="bg-white overflow-hidden shadow rounded-lg">
+              <div className="px-4 py-5 sm:p-6">
+                <div className="flex items-center justify-center h-12 w-12 rounded-md bg-primary-600 text-white mx-auto">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 8h2a2 2 0 012 2v6a2 2 0 01-2 2h-2v4l-4-4H9a1.994 1.994 0 01-1.414-.586m0 0L11 14h4a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2v4l.586-.586z" />
+                  </svg>
+                </div>
+                <h3 className="mt-4 text-lg font-medium text-gray-900 text-center">Expert Consultations</h3>
+                <p className="mt-2 text-base text-gray-500 text-center">
+                  Our team of tax professionals provides personalized guidance for your specific non-resident tax situation.
+                </p>
+              </div>
+            </div>
+
+            <div className="bg-white overflow-hidden shadow rounded-lg">
+              <div className="px-4 py-5 sm:p-6">
+                <div className="flex items-center justify-center h-12 w-12 rounded-md bg-primary-600 text-white mx-auto">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
+                  </svg>
+                </div>
+                <h3 className="mt-4 text-lg font-medium text-gray-900 text-center">Tax Compliance Support</h3>
+                <p className="mt-2 text-base text-gray-500 text-center">
+                  We help you understand filing requirements and navigate treaty benefits to ensure compliance with U.S. tax laws.
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Our experts section */}
+        <div className="mt-12">
+          <h2 className="text-2xl font-bold text-gray-900 mb-6">Our Tax Experts</h2>
+          <div className="grid grid-cols-1 gap-8 sm:grid-cols-2 lg:grid-cols-3">
+            <div className="bg-white overflow-hidden shadow rounded-lg">
+              <div className="px-4 py-5 sm:p-6 text-center">
+                <div className="h-32 w-32 rounded-full bg-gray-200 mx-auto mb-4"></div>
+                <h3 className="text-lg font-medium text-gray-900">Sarah Chen, CPA</h3>
+                <p className="text-sm text-gray-500">International Tax Specialist</p>
+                <p className="mt-3 text-base text-gray-600">
+                  Sarah has 15+ years of experience helping international clients navigate U.S. tax regulations.
+                </p>
+              </div>
+            </div>
+
+            <div className="bg-white overflow-hidden shadow rounded-lg">
+              <div className="px-4 py-5 sm:p-6 text-center">
+                <div className="h-32 w-32 rounded-full bg-gray-200 mx-auto mb-4"></div>
+                <h3 className="text-lg font-medium text-gray-900">Michael Rodriguez, EA</h3>
+                <p className="text-sm text-gray-500">Tax Treaty Expert</p>
+                <p className="mt-3 text-base text-gray-600">
+                  Michael specializes in U.S. tax treaties and their application to students and researchers.
+                </p>
+              </div>
+            </div>
+
+            <div className="bg-white overflow-hidden shadow rounded-lg">
+              <div className="px-4 py-5 sm:p-6 text-center">
+                <div className="h-32 w-32 rounded-full bg-gray-200 mx-auto mb-4"></div>
+                <h3 className="text-lg font-medium text-gray-900">Jennifer Kim, JD</h3>
+                <p className="text-sm text-gray-500">Tax Attorney</p>
+                <p className="mt-3 text-base text-gray-600">
+                  Jennifer provides guidance on complex legal aspects of non-resident taxation and compliance.
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* CTA section */}
+        <div className="mt-12 bg-primary-700 rounded-lg shadow-xl overflow-hidden">
+          <div className="px-4 py-8 sm:px-6 sm:py-12 text-center">
+            <h2 className="text-2xl font-bold text-white">
+              Ready to simplify your U.S. tax experience?
+            </h2>
+            <p className="mt-2 text-lg leading-6 text-primary-100">
+              Join thousands of non-residents who trust RyzeNRTax for reliable tax guidance.
+            </p>
+            <div className="mt-8 flex justify-center">
+              <div className="inline-flex rounded-md shadow">
+                <Link
+                  to="/register"
+                  className="inline-flex items-center justify-center px-5 py-3 border border-transparent text-base font-medium rounded-md text-primary-600 bg-white hover:bg-gray-50"
+                >
+                  Get Started
+                </Link>
+              </div>
+              <div className="ml-3 inline-flex">
+                <Link
+                  to="/contact"
+                  className="inline-flex items-center justify-center px-5 py-3 border border-transparent text-base font-medium rounded-md text-white bg-primary-800 hover:bg-primary-900"
+                >
+                  Contact Us
+                </Link>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default AboutPage;
+EOF
+
+# Create App.js with routing
+cat > src/App.js << 'EOF'
+import React from 'react';
+import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
+import { AuthProvider } from './context/AuthContext';
+
+// Components
+import Header from './components/Header';
+import Footer from './components/Footer';
+
+// Pages
+import HomePage from './pages/HomePage';
+import LoginPage from './pages/LoginPage';
+import RegisterPage from './pages/RegisterPage';
+import TaxGuidesPage from './pages/TaxGuidesPage';
+import TaxGuideDetailPage from './pages/TaxGuideDetailPage';
+import FAQsPage from './pages/FAQsPage';
+import PricingPage from './pages/PricingPage';
+import ConsultationFormPage from './pages/ConsultationFormPage';
+import ConsultationsPage from './pages/ConsultationsPage';
+import AboutPage from './pages/AboutPage';
+
+function App() {
+  return (
+    <AuthProvider>
+      <Router>
+        <div className="flex flex-col min-h-screen">
+          <Header />
+          <main className="flex-grow">
+            <Routes>
+              <Route path="/" element={<HomePage />} />
+              <Route path="/login" element={<LoginPage />} />
+              <Route path="/register" element={<RegisterPage />} />
+              <Route path="/tax-guides" element={<TaxGuidesPage />} />
+              <Route path="/tax-guides/:id" element={<TaxGuideDetailPage />} />
+              <Route path="/faqs" element={<FAQsPage />} />
+              <Route path="/pricing" element={<PricingPage />} />
+              <Route path="/consultations" element={<ConsultationsPage />} />
+              <Route path="/consultations/new" element={<ConsultationFormPage />} />
+              <Route path="/about" element={<AboutPage />} />
+            </Routes>
+          </main>
+          <Footer />
+        </div>
+      </Router>
+    </AuthProvider>
+  );
+}
+
+export default App;
+EOF
+
+# Create index.js
+cat > src/index.js << 'EOF'
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import './index.css';
+import App from './App';
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+EOF
+
+# Final setup scripts
+cd ../
+
+# Create a README file
+cat > README.md << 'EOF'
+# RyzeNRTax - Non-Resident Tax Information Platform
+
+RyzeNRTax is a full-stack web application designed to provide tax information and services for non-residents of the United States, with a focus on international students and professionals.
+
+## Features
+
+- **Free Resources**: Access to basic tax guides, FAQs, and general information about non-resident tax obligations
+- **Premium Content**: Advanced tax planning guides, detailed explanations, and personalized consultations
+- **User Authentication**: Secure login and registration system
+- **Consultation Requests**: Ability for users to request personalized tax consultations
+- **Responsive Design**: Mobile-friendly interface using React and Tailwind CSS
+
+## Tech Stack
+
+- **Frontend**: React, Tailwind CSS
+- **Backend**: FastAPI (Python)
+- **Database**: PostgreSQL
+- **Authentication**: JWT-based authentication
+
+## Development Setup
+
+### Prerequisites
+
+- Python 3.8+
+- Node.js 14+
+- PostgreSQL
+
+### Backend Setup
+
+1. Create and activate a virtual environment:
+
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+2. Install dependencies:
+
+cd backend
+pip install -r requirements.txt
+
+3. Set up the database:
+
+python app/db/init_db.py
+
+4. Start the backend server:
+
+uvicorn app.main --reload
+
+### Frontend Setup
+
+1. Install dependencies:
+
+cd frontend
+npm install
+
+2. Start the development server:
+
+npm start
+
+## Deployment
+
+1. Build the frontend:
+
+cd frontend
+npm run build
+
+2. Configure your production server with proper environment variables
+EOF
+
+# Final instruction file with startup commands
+cat > STARTUP_INSTRUCTIONS.md << 'EOF'
+# RyzeNRTax Startup Instructions
+
+## Starting the Backend Server
+
+1. Navigate to the backend directory
+
+Here's the final part of the commands to finish setting up the application:
+
+# Creating the startup instructions file
+cat > STARTUP_INSTRUCTIONS.md << 'EOF'
+# RyzeNRTax Startup Instructions
+
+## Starting the Backend Server
+
+1. Navigate to the backend directory:
+
+cd ryze-nrtax/backend
+
+2. Activate the virtual environment:
+
+source ../../venv/bin/activate  # On Windows: ....\venv\Scripts\activate
+
+3. Start the FastAPI server:
+
+uvicorn app.main --reload --host 0.0.0.0 --port 8000
+
+4. The API will be available at http://localhost:8000
+
+## Starting the Frontend Server
+
+1. In a new terminal window, navigate to the frontend directory:
+
+cd ryze-nrtax/frontend
+
+2. Start the React development server:
+
+npm start
+
+3. The frontend will be available at http://localhost:3000
+
+## Accessing the Application
+
+- Frontend: http://localhost:3000
+- API Documentation: http://localhost:8000/docs
+
+## Default Sample Data
+
+The application comes with pre-populated sample data for tax guides and FAQs. To add more data or create administrator accounts, you can use the API endpoints documented at http://localhost:8000/docs.
+EOF
+
+# Create a docker-compose file for easy deployment
+cat > docker-compose.yml << 'EOF'
+version: '3.8'
+
+services:
+db:
+ image: postgres:13
+ volumes:
+   - postgres_data:/var/lib/postgresql/data/
+ environment:
+   - POSTGRES_USER=postgres
+   - POSTGRES_PASSWORD=postgres
+   - POSTGRES_DB=ryze_nrtax_db
+ ports:
+   - "5432:5432"
+
+backend:
+ build: ./ryze-nrtax/backend
+ command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+ volumes:
+   - ./ryze-nrtax/backend:/app
+ ports:
+   - "8000:8000"
+ depends_on:
+   - db
+ environment:
+   - DATABASE_URL=postgresql://postgres:postgres@db/ryze_nrtax_db
+
+frontend:
+ build: ./ryze-nrtax/frontend
+ volumes:
+   - ./ryze-nrtax/frontend:/app
+   - /app/node_modules
+ ports:
+   - "3000:3000"
+ stdin_open: true
+ depends_on:
+   - backend
+
+volumes:
+postgres_data:
+EOF
+
+echo "Project setup complete! Navigate to the ryze-nrtax directory to start working with the application."
+
+
