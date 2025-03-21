@@ -1,5 +1,5 @@
 # File Name: setup_backend.sh
-# Description: Backend setup script for RyzeNRTax application
+# Description: Backend setup script for NR Tax Solutions application
 
 #!/bin/bash
 

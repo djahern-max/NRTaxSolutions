@@ -1,10 +1,10 @@
 # File Name: main_setup.sh
-# Description: Main setup script for RyzeNRTax application
+# Description: Main setup script for NR Tax Solutions application
 
 #!/bin/bash
 
-# RyzeNRTax Application Setup Script
-# This script automates the creation of the RyzeNRTax application
+# NR Tax Solutions Application Setup Script
+# This script automates the creation of the NR Tax Solutions application
 
 # Set text colors
 GREEN='\033[0;32m'
@@ -24,7 +24,7 @@ handle_error() {
 
 # Display welcome message
 echo -e "${GREEN}========================================================"
-echo -e "       RyzeNRTax Application Setup"
+echo -e "       NR Tax Solutions Application Setup"
 echo -e "========================================================${NC}"
 echo ""
 echo -e "This script will automate the creation of your ${PROJECT_NAME} application."

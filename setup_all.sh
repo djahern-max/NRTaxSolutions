@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# RyzeNRTax Setup All Script
-# This script automates the complete setup of the RyzeNRTax application
+# NR Tax Solutions Setup All Script
+# This script automates the complete setup of the NR Tax Solutions application
 
 # Set text colors
 GREEN='\033[0;32m'
@@ -10,7 +10,7 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 echo -e "${GREEN}========================================================"
-echo -e "       RyzeNRTax Complete Setup"
+echo -e "       NR Tax Solutions Complete Setup"
 echo -e "========================================================${NC}"
 
 # Execute all setup scripts in order

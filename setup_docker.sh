@@ -7,7 +7,7 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 echo -e "${GREEN}========================================================"
-echo -e "       Setting up Docker for RyzeNRTax"
+echo -e "       Setting up Docker for NR Tax Solutions"
 echo -e "========================================================${NC}"
 
 # Check if Docker is installed

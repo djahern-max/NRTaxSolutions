@@ -1,0 +1,4 @@
+
+I was wondering if you could create a website called NRtaxhelp.com that is aimed to help Non Residents in the US with all the challenges they face.  I am starting a business that helps these individuals so there would be a clear call to action for them to be prepared and also go after taxes they may have overpaid on.  I want to educate them on all the various treaties and all the problems that can arise if they aren't prepared.  if you could provide all the files so I can insert them directly into the command line please.  I want to create the files through the command line here ryze.ai@Danes-MacBook-Pro NRTaxHelp.com % pwd
+/Users/ryze.ai/Desktop/NRTaxHelp.com
+ryze.ai@Danes-MacBook-Pro NRTaxHelp.com %

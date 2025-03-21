@@ -6,7 +6,7 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
-echo -e "${YELLOW}Stopping RyzeNRTax application...${NC}"
+echo -e "${YELLOW}Stopping NR Tax Solutions application...${NC}"
 
 if [ -f .app_pids ]; then
     read -r BACKEND_PID FRONTEND_PID < .app_pids

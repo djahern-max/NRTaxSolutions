@@ -7,7 +7,7 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 echo -e "${GREEN}========================================================"
-echo -e "       Starting RyzeNRTax Application"
+echo -e "       Starting NR Tax Solutions Application"
 echo -e "========================================================${NC}"
 
 # Check if the backend and frontend directories exist
@@ -37,7 +37,7 @@ FRONTEND_PID=$!
 echo -e "Frontend development server started with PID: $FRONTEND_PID"
 cd ..
 
-echo -e "\n${GREEN}RyzeNRTax application is now running!${NC}"
+echo -e "\n${GREEN}NR Tax Solutions application is now running!${NC}"
 echo -e "Backend: http://localhost:8000"
 echo -e "Frontend: http://localhost:3000"
 echo -e "API Documentation: http://localhost:8000/docs"

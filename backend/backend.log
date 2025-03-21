@@ -1,6 +1,6 @@
 INFO:     Will watch for changes in these directories: ['/Users/ryze.ai/Desktop/NR_TAX/backend']
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-INFO:     Started reloader process [7688] using StatReload
+INFO:     Started reloader process [29834] using StatReload
 Process SpawnProcess-1:
 Traceback (most recent call last):
   File "/Users/ryze.ai/Desktop/NR_TAX/backend/venv/lib/python3.13/site-packages/pydantic/networks.py", line 925, in import_email_validator

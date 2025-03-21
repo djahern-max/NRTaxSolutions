@@ -7,7 +7,7 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 echo -e "${GREEN}========================================================"
-echo -e "       Setting up RyzeNRTax Database"
+echo -e "       Setting up NR Tax Solutions Database"
 echo -e "========================================================${NC}"
 
 # Check if PostgreSQL is installed
